@@ -1,13 +1,18 @@
 // PHP2Shell hunting: Azure Front Door. Each block below is self-contained.
 // Click anywhere inside a block and select Run; Log Analytics runs only the block
 // at the cursor (blocks are separated by blank lines).
+//
+// Updated 2026-10-26. Lookback starts 2026-10-15: AWS saw exploitation on
+// 2026-10-17, before public disclosure. Front Door managed rule 99006001 is
+// response-side only and writes no WAF log entries, so it never shows up here.
 
 // -----------------------------------------------------------------------------
-// Q1. Known PHP2Shell tooling: scanner/PoC user agents, probe paths, early
-//     source IPs. IPs and UAs change easily; treat hits as confirmed, misses as
-//     inconclusive.
+// Q1. Known PHP2Shell tooling: scanner/PoC user agents, probe paths, and
+//     published source IPs (VulnCheck, AWS MadPot, LevelBlue). Some IPs are
+//     shared anonymization infrastructure, so validate hits against the request
+//     shape; misses are inconclusive. Some UAs carry a PHP payload ("<?php").
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -39,9 +44,16 @@ let AfdWaf = AzureDiagnostics
         Details  = strcat(tostring(column_ifexists("details_matches_s", "")), " ",
                           tostring(column_ifexists("details_msg_s", "")), " ",
                           tostring(column_ifexists("details_data_s", "")));
-let IocIps = dynamic(["109.71.252.97", "221.14.159.134", "45.198.224.169"]);
+let IocIps = dynamic([
+    // VulnCheck canaries, 2026-10-21 (probe, verify, exploit)
+    "85.11.167.243", "45.198.224.169", "109.71.252.97", "221.14.159.134", "91.90.123.25",
+    // AWS MadPot, 2026-10-17 and 2026-10-21
+    "103.216.220.92", "31.223.184.166", "37.19.200.5", "134.209.159.64", "103.114.163.188", "95.217.98.37",
+    // LevelBlue, suspected exploitation
+    "64.95.12.7", "34.22.235.83"]);
 AfdAccess
-| where UA contains "php2shell" or Path contains "php2shell" or ClientIp in (IocIps)
+| where UA contains "php2shell" or UA contains "php-upload-progress-scan" or UA contains "<?php"
+     or Path contains "php2shell" or ClientIp in (IocIps)
 | summarize Requests = count(), First = min(TimeGenerated), Last = max(TimeGenerated),
             Hosts = make_set(Host, 25), Statuses = make_set(Status), Paths = make_set(Path, 25),
             UAs = make_set(UA, 5)
@@ -49,11 +61,12 @@ AfdAccess
 | order by Requests desc
 
 // -----------------------------------------------------------------------------
-// Q2. WAF matches on exploit content: the upload-progress field, the PoC web
-//     shell marker, or PoC multipart boundaries. Joined to the access log to show
-//     whether the request reached the origin and what it returned.
+// Q2. WAF matches on exploit content: the upload-progress field, PoC web shell
+//     and output markers, PoC multipart boundaries, or Microsoft's PHP2Shell
+//     custom rules (rename CustomRules if yours differ). Joined to the access log
+//     to show whether the request reached the origin and what it returned.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -85,11 +98,16 @@ let AfdWaf = AzureDiagnostics
         Details  = strcat(tostring(column_ifexists("details_matches_s", "")), " ",
                           tostring(column_ifexists("details_msg_s", "")), " ",
                           tostring(column_ifexists("details_data_s", "")));
+let CustomRules = dynamic(["BlockPhpSessionUploadProgress", "PhpFormNesting20", "PhpMultipartNesting20", "BlockLargeRequestBody"]);
 AfdWaf
 | where Details contains "PHP_SESSION_UPLOAD_PROGRESS"
      or Details contains "PWNED::"
+     or Details contains "php2shell_out_start"
+     or Details contains "p2sprobe"
      or Details contains "----p2s"
+     or Details contains "----php2shell"
      or Uri contains "php2shell"
+     or Rule has_any (CustomRules)
 | join kind=leftouter (AfdAccess | project Ref, OriginStatus = Status, UA, Origin) on Ref
 | project TimeGenerated, ClientIp, Host, Uri, Rule, Action, Mode, Policy, OriginStatus, Origin, UA, Details
 | order by TimeGenerated asc
@@ -97,9 +115,11 @@ AfdWaf
 // -----------------------------------------------------------------------------
 // Q3. CVE-2026-109618 "arm then fire" shape: a large POST that returns 500,
 //     followed within 10 minutes by a POST returning 502/503/504 from the same
-//     client to the same host. Tune ArmMinBytes for your apps.
+//     client to the same host. Tune ArmMinBytes for your apps. Reported payloads
+//     range from about 60 KB (F5) to about 60 MB (Microsoft). A successful exploit
+//     can return 200, so a miss here does not rule out exploitation.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -131,7 +151,7 @@ let AfdWaf = AzureDiagnostics
         Details  = strcat(tostring(column_ifexists("details_matches_s", "")), " ",
                           tostring(column_ifexists("details_msg_s", "")), " ",
                           tostring(column_ifexists("details_data_s", "")));
-let ArmMinBytes = 262144;   // 256 KB
+let ArmMinBytes = 51200;   // 50 KB
 let Arms = AfdAccess
     | where Method == "POST" and ReqBytes >= ArmMinBytes and Status == 500
     | project ArmTime = TimeGenerated, ClientIp, Host, ArmPath = Path, ArmBytes = ReqBytes;
@@ -148,9 +168,9 @@ Arms
 
 // -----------------------------------------------------------------------------
 // Q4. Amplification bursts: more than 3 large POSTs from one client to one host
-//     inside 2 minutes. Reported attack traffic used bodies of a few hundred KB.
+//     inside 2 minutes. Reported payloads range from about 60 KB to about 60 MB.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -183,7 +203,7 @@ let AfdWaf = AzureDiagnostics
                           tostring(column_ifexists("details_msg_s", "")), " ",
                           tostring(column_ifexists("details_data_s", "")));
 AfdAccess
-| where Method == "POST" and ReqBytes >= 102400   // 100 KB
+| where Method == "POST" and ReqBytes >= 51200   // 50 KB
 | summarize Posts = count(), Errors5xx = countif(Status >= 500), AvgKB = avg(ReqBytes) / 1024
     by ClientIp, Host, Window = bin(TimeGenerated, 2m)
 | where Posts > 3
@@ -193,10 +213,10 @@ AfdAccess
 | order by Total5xx desc, TotalPosts desc
 
 // -----------------------------------------------------------------------------
-// Q5. POST 5xx trend per host. Look for hosts that spike from October 21, 2026
+// Q5. POST 5xx trend per host. Look for hosts that spike from October 17, 2026
 //     onward without a matching deployment or outage.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -237,7 +257,7 @@ AfdAccess
 // Q6. Possible web shell use: requests to .php paths with a command-style query
 //     parameter (the published PoC shell reads $_GET['c']).
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -281,7 +301,7 @@ AfdAccess
 // Q7. Recon: phpinfo-style probes. Many hosts from one source is scanning; any
 //     200 response is an exposed phpinfo page worth removing regardless.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -323,9 +343,41 @@ AfdAccess
 | order by Hits200 desc, Hosts desc
 
 // -----------------------------------------------------------------------------
-// Q8. Pivot: full timeline for suspect IPs from Q1-Q7 across access and WAF logs.
+// Q8. CVE-2026-109619 heap grooming: many small POSTs from one client to "/" or
+//     "/index.php" in a short window. F5 reports this as the most common pattern
+//     (fresh PHPSESSID and multipart boundary per request, generic Mozilla UA).
+//     Tune MinPosts for hosts that take legitimate form posts at the root.
 // -----------------------------------------------------------------------------
-let lookback = 14d;
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
+let AfdAccess = AzureDiagnostics
+    | where TimeGenerated > ago(lookback)
+    | where Category in~ ("FrontDoorAccessLog")
+    | extend Uri = tostring(column_ifexists("requestUri_s", ""))
+    | extend
+        ClientIp  = tostring(column_ifexists("clientIp_s", "")),
+        Host      = coalesce(tostring(column_ifexists("hostName_s", "")), tostring(parse_url(Uri).Host)),
+        Path      = tostring(parse_url(Uri).Path),
+        Query     = extract(@"\?([^#]*)", 1, Uri),
+        Method    = toupper(tostring(column_ifexists("httpMethod_s", ""))),
+        UA        = tostring(column_ifexists("userAgent_s", "")),
+        Status    = toint(coalesce(tostring(column_ifexists("httpStatusCode_s", "")), tostring(column_ifexists("httpStatusCode_d", real(null))))),
+        ReqBytes  = tolong(coalesce(tostring(column_ifexists("requestBytes_s", "")), tostring(column_ifexists("requestBytes_d", real(null))))),
+        TimeTaken = todouble(coalesce(tostring(column_ifexists("timeTaken_s", "")), tostring(column_ifexists("timeTaken_d", real(null))))),
+        Origin    = tostring(column_ifexists("originName_s", "")),
+        Ref       = tostring(column_ifexists("trackingReference_s", ""));
+let MinPosts = 20;
+AfdAccess
+| where Method == "POST" and Path in ("/", "/index.php") and ReqBytes < 8192
+| summarize Posts = count() by ClientIp, Host, Window = bin(TimeGenerated, 10m)
+| where Posts >= MinPosts
+| summarize Windows = count(), TotalPosts = sum(Posts), First = min(Window), Last = max(Window)
+    by ClientIp, Host
+| order by TotalPosts desc
+
+// -----------------------------------------------------------------------------
+// Q9. Pivot: full timeline for suspect IPs from Q1-Q8 across access and WAF logs.
+// -----------------------------------------------------------------------------
+let lookback = now() - datetime(2026-10-15);   // earliest known exploitation: 2026-10-17
 let AfdAccess = AzureDiagnostics
     | where TimeGenerated > ago(lookback)
     | where Category in~ ("FrontDoorAccessLog")
@@ -371,10 +423,12 @@ union
 // diagnostic category.
 // =============================================================================
 AppServiceHTTPLogs
-| where TimeGenerated > ago(14d)
+| where TimeGenerated > datetime(2026-10-15)
 | where UserAgent contains "php2shell"
+     or UserAgent contains "php-upload-progress-scan"
+     or UserAgent contains "<?php"
      or CsUriStem contains "php2shell"
-     or (CsMethod == "POST" and CsBytes >= 262144 and ScStatus in (500, 502, 503))
+     or (CsMethod == "POST" and CsBytes >= 51200 and ScStatus in (500, 502, 503))
 | summarize Requests = count(), Statuses = make_set(ScStatus), First = min(TimeGenerated),
             Last = max(TimeGenerated), Paths = make_set(CsUriStem, 10)
     by CIp, CsHost, UserAgent, _ResourceId

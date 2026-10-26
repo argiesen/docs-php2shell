@@ -18,6 +18,11 @@
 
     Fixed upstream PHP releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. Branches 8.1 and older are EOL.
 
+    App Service status (as of 2026-10-26): patched built-in PHP images are live on the Latest and
+    Standard release channels on Linux (rolled out 2026-10-21). The Extended channel is patched
+    last; Microsoft advises moving those apps to Standard or Latest. Built-in PHP on Windows is
+    EOL and no patch is planned.
+
     Container images are classified by image name only. An image without "php" in its name can
     still contain PHP, so "Unknown" rows need image inspection or a vulnerability scan.
 
@@ -87,11 +92,11 @@ function Get-BuiltInAssessment {
     if (-not $Fixed.ContainsKey($mm)) {
         return "EOL branch ($Version). No upstream fix. Change the stack to PHP 8.3 or later."
     }
-    $msg = "Platform-managed. Vulnerable until App Service rolls PHP $($Fixed[$mm]) or later to this app's channel. Verify with 'php -v' over SSH."
+    $verify = "Verify with 'php -v' over SSH (expect $($Fixed[$mm]) or later); if it still reports an older build, open a support case."
     switch -Regex ($Channel) {
-        'Extended' { "HIGH: Extended channel lags Standard. $msg" }
-        'Latest'   { "Latest channel receives patches first. $msg" }
-        default    { $msg }
+        'Extended' { "HIGH: Extended channel is patched last. Move to Standard or Latest. $verify" }
+        'Latest'   { "Platform-managed. Patched image released to Latest on 2026-10-21. $verify" }
+        default    { "Platform-managed. Patched image released to Standard on 2026-10-21. $verify" }
     }
 }
 
@@ -248,7 +253,7 @@ foreach ($s in $sites) {
             Hosting        = 'Windows PHP handler'
             PhpStack       = $cfg.phpVersion
             ReleaseChannel = 'N/A (Linux only)'
-            Assessment     = "PHP $($cfg.phpVersion) handler is enabled on a Windows app. Windows PHP is not a supported App Service stack and receives no fix. Set PHP to Off if unused; migrate to Linux if used."
+            Assessment     = "PHP $($cfg.phpVersion) handler is enabled on a Windows app. Microsoft states built-in Windows PHP runtimes are EOL and no patch is planned. Set PHP to Off if unused; migrate to Linux if used."
         }
     }
 }

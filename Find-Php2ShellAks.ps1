@@ -12,14 +12,19 @@
     Detection layers:
       1. Image name heuristic (always).
       2. Optional in-container probe (-ProbePhp): runs a read-only shell command in one running
-         pod per workload to report the PHP version and, on Debian/Ubuntu images, the distro
-         package version. Requires pods/exec rights and a shell in the image.
+         pod per workload to report the PHP version, the distro package version on Debian/Ubuntu
+         images, whether the dpkg or rpm changelog mentions either CVE (distro backport), and the
+         CLI value of session.upload_progress.enabled. Requires pods/exec rights and a shell in
+         the image. FPM pool settings (php_admin_value) and Debian's separate CLI php.ini can
+         differ from what the web SAPI uses.
       3. Defender for Cloud container vulnerability findings that reference either CVE.
 
     Exposure is derived from LoadBalancer and NodePort services and Ingress backends that select
     the pod. Gateway API routes and service mesh gateways are not evaluated.
 
-    Fixed upstream PHP releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. Branches 8.1 and older are EOL.
+    Fixed upstream PHP releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. Branches 7.4, 8.0, and 8.1 have
+    no upstream release, but distributions ship backported fixes; the official Docker php images
+    for 8.1 and older do not. Branches 7.3 and older have no fix.
 
 .PARAMETER ProbePhp
     Exec into one running pod per workload to read the PHP version.
@@ -50,11 +55,12 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
 $Fixed    = @{ '8.2' = '8.2.35'; '8.3' = '8.3.36'; '8.4' = '8.4.27'; '8.5' = '8.5.12' }
+$Backport = @('7.4', '8.0', '8.1')
 $SystemNs = @('kube-system', 'kube-public', 'kube-node-lease', 'gatekeeper-system', 'calico-system',
               'tigera-operator', 'aks-command', 'aks-istio-system', 'app-routing-system')
 
-# Prints "<php version or NOPHP>|<debian package=version list>"
-$ProbeScript = 'v=$(php -r "echo PHP_VERSION;" 2>/dev/null); [ -z "$v" ] && v=$(php-fpm -v 2>/dev/null | head -n1 | cut -d" " -f2); [ -z "$v" ] && v="$PHP_VERSION"; p=$(dpkg-query -W -f="\${Package}=\${Version} " "php*-common" 2>/dev/null); echo "${v:-NOPHP}|$p"'
+# Prints "<php version or NOPHP>|<debian package=version list>|<changelog CVE mentions>|<CLI session.upload_progress.enabled>"
+$ProbeScript = 'v=$(php -r "echo PHP_VERSION;" 2>/dev/null); [ -z "$v" ] && v=$(php-fpm -v 2>/dev/null | head -n1 | cut -d" " -f2); [ -z "$v" ] && v="$PHP_VERSION"; p=$(dpkg-query -W -f="\${Package}=\${Version} " "php*-common" 2>/dev/null | sed "s/[^ ]*= //g"); b=$( (zcat /usr/share/doc/php*-common/changelog.Debian.gz 2>/dev/null; rpm -q --changelog php-common 2>/dev/null) | grep -c "CVE-2026-10961[89]"); i=$(php -r ''echo "x", ini_get("session.upload_progress.enabled");'' 2>/dev/null); echo "${v:-NOPHP}|$p|${b:-0}|$i"'
 
 $rows          = [System.Collections.Generic.List[object]]::new()
 $clusterStatus = [System.Collections.Generic.List[object]]::new()
@@ -134,16 +140,19 @@ function Get-NameAssessment {
 
 function Get-ProbeAssessment {
     param([string]$Raw)
-    $ver, $pkg = $Raw.Trim() -split '\|', 2
-    $pkg = $pkg.Trim()
+    $ver, $pkg, $cl, $null = $Raw.Trim() -split '\|', 4
+    $pkg = "$pkg".Trim()
     if ($ver -eq 'NOPHP') { return 'No PHP found in container.' }
     if ($ver -notmatch '^(\d+)\.(\d+)\.(\d+)') { return "PHP detected, unparsed version '$ver'. Review manually." }
     $mm  = "$($Matches[1]).$($Matches[2])"
     $cur = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
-    $a = if (-not $Fixed.ContainsKey($mm)) { "VULNERABLE: EOL branch $ver. No upstream fix." }
-         elseif ($cur -ge [version]$Fixed[$mm]) { "Patched: $ver meets $($Fixed[$mm])." }
+    $backported = [int]("0$cl".Trim()) -gt 0
+    $a = if ($Fixed.ContainsKey($mm) -and $cur -ge [version]$Fixed[$mm]) { "Patched: $ver meets $($Fixed[$mm])." }
+         elseif ($backported) { "Patched (distro backport): package changelog references the CVEs. Upstream version $ver." }
+         elseif ($mm -in $Backport) { "VULNERABLE unless backported: EOL branch $ver has no upstream release and no CVE in the package changelog. Upgrade, or use a distro/LTS package with the backport." }
+         elseif (-not $Fixed.ContainsKey($mm)) { "VULNERABLE: EOL branch $ver. No fix from PHP." }
          else { "VULNERABLE: $ver is below $($Fixed[$mm])." }
-    if ($pkg) {
+    if ($pkg -and -not $backported) {
         $a += " Distro package: $pkg. Distros backport fixes without changing the upstream version, so confirm the package revision against the vendor advisory."
     }
     $a
@@ -252,12 +261,17 @@ foreach ($k in $clusters) {
 
         foreach ($g in $groups.Values) {
             $php = 'Not probed'
+            $cliIni = $null
             $assessment = Get-NameAssessment $g.Image
 
             if ($ProbePhp -and $mode -eq 'kubectl' -and -not $g.Init -and $g.Running.Count) {
                 try {
                     $raw = Invoke-Kubectl $kc @('exec', '-n', $g.Namespace, $g.Running[0], '-c', $g.Container, '--', 'sh', '-c', $ProbeScript)
-                    $php = ($raw.Trim() -split '\|')[0]
+                    $fields = $raw.Trim() -split '\|'
+                    $php = $fields[0]
+                    if ($php -ne 'NOPHP' -and $fields.Count -ge 4 -and $fields[3] -match '^x(.*)$') {
+                        $cliIni = 'upload_progress=' + $(if ($Matches[1] -in '1', 'On') { 'On' } else { 'Off' })
+                    }
                     $assessment = Get-ProbeAssessment $raw
                 }
                 catch {
@@ -277,6 +291,7 @@ foreach ($k in $clusters) {
                 ImageDigest  = $g.Digest
                 Exposure     = $g.Exposure
                 PhpDetected  = $php
+                CliIni       = $cliIni
                 Assessment   = $assessment
             })
         }

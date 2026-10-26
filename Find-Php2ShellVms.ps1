@@ -17,7 +17,9 @@
     Every machine is reported. Machines with no software inventory are marked as a coverage gap,
     because "no PHP found" is meaningless without inventory.
 
-    Fixed upstream PHP releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. Branches 8.1 and older are EOL.
+    Fixed upstream PHP releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. Branches 7.4, 8.0, and 8.1 have
+    no upstream release, but distributions and LTS vendors ship backported fixes. Branches 7.3 and
+    older have no fix.
 
 .PARAMETER PhpOnly
     Omit machines with inventory and no PHP. Coverage-gap machines are still reported.
@@ -35,8 +37,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Fixed = @{ '8.2' = '8.2.35'; '8.3' = '8.3.36'; '8.4' = '8.4.27'; '8.5' = '8.5.12' }
-$rows  = [System.Collections.Generic.List[object]]::new()
+$Fixed     = @{ '8.2' = '8.2.35'; '8.3' = '8.3.36'; '8.4' = '8.4.27'; '8.5' = '8.5.12' }
+$Backport  = @('7.4', '8.0', '8.1')
+$rows      = [System.Collections.Generic.List[object]]::new()
 
 #region Helpers
 function Invoke-Arg {
@@ -74,7 +77,10 @@ function Get-VersionAssessment {
     $mm  = "$($Matches[1]).$($Matches[2])"
     $cur = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
     $note = ' If PHP came from distro packages, confirm the package revision; distros backport fixes without changing the upstream version.'
-    if (-not $Fixed.ContainsKey($mm)) { return "VULNERABLE: EOL branch $Version. No upstream fix.$note" }
+    if ($mm -in $Backport) {
+        return "VULNERABLE unless backported: EOL branch $Version has no upstream release. Check the package changelog for CVE-2026-109618 (dpkg: zgrep the php*-common changelog.Debian.gz; rpm: rpm -q --changelog php-common), or upgrade."
+    }
+    if (-not $Fixed.ContainsKey($mm)) { return "VULNERABLE: EOL branch $Version. No fix from PHP. Upgrade to 8.2 or later." }
     if ($cur -ge [version]$Fixed[$mm]) { return "Patched: $Version meets $($Fixed[$mm])." }
     "VULNERABLE: $Version is below $($Fixed[$mm]).$note"
 }
@@ -223,5 +229,6 @@ $machines | Group-Object { $plans[$_.subscriptionId] ?? 'Unknown' } |
 if (-not $findings.Count) {
     Write-Host 'No Defender findings reference either CVE yet. Treat this as unknown until Defender Vulnerability Management adds them.' -ForegroundColor Yellow
 }
+Write-Host 'For machines onboarded to Defender for Endpoint, also check DeviceTvmSoftwareVulnerabilities in Defender XDR advanced hunting.' -ForegroundColor Yellow
 Write-Host "CSV written to $OutputPath" -ForegroundColor Green
 #endregion
